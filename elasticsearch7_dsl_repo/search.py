@@ -1,13 +1,22 @@
+import copy
+
+try:
+    import collections.abc as collections_abc  # only works on python 3.3+
+except ImportError:
+    import collections as collections_abc
+
 from six import iteritems, string_types
 
 from elasticsearch.helpers import scan
 from elasticsearch.exceptions import TransportError
 
-from .query import Q, EMPTY_QUERY, Bool
+from .query import Q, Bool
 from .aggs import A, AggBase
-from .utils import DslBase
-from .result import Response, Result, SuggestResponse
-from .connections import connections
+from .utils import DslBase, AttrDict
+from .response import Response, Hit
+from .connections import get_connection
+from .exceptions import IllegalOperation
+
 
 class QueryProxy(object):
     """
@@ -17,16 +26,23 @@ class QueryProxy(object):
     """
     def __init__(self, search, attr_name):
         self._search = search
-        self._proxied = EMPTY_QUERY
+        self._proxied = None
         self._attr_name = attr_name
 
     def __nonzero__(self):
-        return self._proxied != EMPTY_QUERY
+        return self._proxied is not None
     __bool__ = __nonzero__
 
     def __call__(self, *args, **kwargs):
         s = self._search._clone()
-        getattr(s, self._attr_name)._proxied &= Q(*args, **kwargs)
+
+        # we cannot use self._proxied since we just cloned self._search and
+        # need to access the new self on the clone
+        proxied = getattr(s, self._attr_name)
+        if proxied._proxied is None:
+            proxied._proxied = Q(*args, **kwargs)
+        else:
+            proxied._proxied &= Q(*args, **kwargs)
 
         # always return search to be chainable
         return s
@@ -39,6 +55,12 @@ class QueryProxy(object):
             self._proxied = Q(self._proxied.to_dict())
             setattr(self._proxied, attr_name, value)
         super(QueryProxy, self).__setattr__(attr_name, value)
+
+    def __getstate__(self):
+        return self._search, self._proxied, self._attr_name
+
+    def __setstate__(self, state):
+        self._search, self._proxied, self._attr_name = state
 
 
 class ProxyDescriptor(object):
@@ -63,11 +85,13 @@ class ProxyDescriptor(object):
 class AggsProxy(AggBase, DslBase):
     name = 'aggs'
     def __init__(self, search):
-        self._base = self._search = search
+        self._base = self
+        self._search = search
         self._params = {'aggs': {}}
 
     def to_dict(self):
         return super(AggsProxy, self).to_dict().get('aggs', {})
+
 
 class Request(object):
     def __init__(self, using='default', index=None, doc_type=None, extra=None):
@@ -82,16 +106,27 @@ class Request(object):
         self._doc_type = []
         self._doc_type_map = {}
         if isinstance(doc_type, (tuple, list)):
-            for dt in doc_type:
-                self._add_doc_type(dt)
-        elif isinstance(doc_type, dict):
+            self._doc_type.extend(doc_type)
+        elif isinstance(doc_type, collections_abc.Mapping):
             self._doc_type.extend(doc_type.keys())
             self._doc_type_map.update(doc_type)
         elif doc_type:
-            self._add_doc_type(doc_type)
+            self._doc_type.append(doc_type)
 
         self._params = {}
         self._extra = extra or {}
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Request) and
+            other._params == self._params and
+            other._index == self._index and
+            other._doc_type == self._doc_type and
+            other.to_dict() == self.to_dict()
+        )
+
+    def __copy__(self):
+        return self._clone()
 
     def params(self, **kwargs):
         """
@@ -117,28 +152,83 @@ class Request(object):
 
             s = Search()
             s = s.index('twitter-2015.01.01', 'twitter-2015.01.02')
+            s = s.index(['twitter-2015.01.01', 'twitter-2015.01.02'])
         """
         # .index() resets
         s = self._clone()
         if not index:
             s._index = None
         else:
-            s._index = (self._index or []) + list(index)
+            indexes = []
+            for i in index:
+                if isinstance(i, string_types):
+                    indexes.append(i)
+                elif isinstance(i, list):
+                    indexes += i
+                elif isinstance(i, tuple):
+                    indexes += list(i)
+
+            s._index = (self._index or []) + indexes
+
         return s
 
-    def _add_doc_type(self, doc_type):
-        if hasattr(doc_type, '_doc_type'):
-            self._doc_type_map[doc_type._doc_type.name] = doc_type.from_es
-            doc_type = doc_type._doc_type.name
-        self._doc_type.append(doc_type)
+    def _resolve_field(self, path):
+        for dt in self._doc_type:
+            if not hasattr(dt, '_index'):
+                continue
+            field = dt._index.resolve_field(path)
+            if field is not None:
+                return field
+
+    def _resolve_nested(self, hit, parent_class=None):
+        doc_class = Hit
+
+        nested_path = []
+        nesting = hit['_nested']
+        while nesting and 'field' in nesting:
+            nested_path.append(nesting['field'])
+            nesting = nesting.get('_nested')
+        nested_path = '.'.join(nested_path)
+
+        if hasattr(parent_class, '_index'):
+            nested_field = parent_class._index.resolve_field(nested_path)
+        else:
+            nested_field = self._resolve_field(nested_path)
+
+        if nested_field is not None:
+            return nested_field._doc_class
+
+        return doc_class
+
+    def _get_result(self, hit, parent_class=None):
+        doc_class = Hit
+        dt = hit.get('_type')
+
+        if '_nested' in hit:
+            doc_class = self._resolve_nested(hit, parent_class)
+
+        elif dt in self._doc_type_map:
+            doc_class = self._doc_type_map[dt]
+
+        else:
+            for doc_type in self._doc_type:
+                if hasattr(doc_type, '_matches') and doc_type._matches(hit):
+                    doc_class = doc_type
+                    break
+
+        for t in hit.get('inner_hits', ()):
+            hit['inner_hits'][t] = Response(self, hit['inner_hits'][t], doc_class=doc_class)
+
+        callback = getattr(doc_class, 'from_es', doc_class)
+        return callback(hit)
 
     def doc_type(self, *doc_type, **kwargs):
         """
         Set the type to search through. You can supply a single value or
-        multiple. Values can be strings or subclasses of ``DocType``.
+        multiple. Values can be strings or subclasses of ``Document``.
 
         You can also pass in any keyword arguments, mapping a doc_type to a
-        callback that should be used instead of the Result class.
+        callback that should be used instead of the Hit class.
 
         If no doc_type is supplied any information stored on the instance will
         be erased.
@@ -153,8 +243,7 @@ class Request(object):
             s._doc_type = []
             s._doc_type_map = {}
         else:
-            for dt in doc_type:
-                s._add_doc_type(dt)
+            s._doc_type.extend(doc_type)
             s._doc_type.extend(kwargs.keys())
             s._doc_type_map.update(kwargs)
         return s
@@ -205,15 +294,13 @@ class Search(Request):
         :arg doc_type: only query this type.
 
         All the parameters supplied (or omitted) at creation type can be later
-        overriden by methods (`using`, `index` and `doc_type` respectively).
+        overridden by methods (`using`, `index` and `doc_type` respectively).
         """
         super(Search, self).__init__(**kwargs)
 
         self.aggs = AggsProxy(self)
         self._sort = []
         self._source = None
-        self._fields = None
-        self._partial_fields = {}
         self._highlight = {}
         self._highlight_opts = {}
         self._suggest = {}
@@ -225,6 +312,9 @@ class Search(Request):
 
     def filter(self, *args, **kwargs):
         return self.query(Bool(filter=[Q(*args, **kwargs)]))
+
+    def exclude(self, *args, **kwargs):
+        return self.query(Bool(filter=[~Q(*args, **kwargs)]))
 
     def __iter__(self):
         """
@@ -296,9 +386,8 @@ class Search(Request):
 
         s._response_class = self._response_class
         s._sort = self._sort[:]
-        s._source = self._source.copy() if self._source else None
-        s._fields = self._fields[:] if self._fields else None
-        s._partial_fields = self._partial_fields.copy()
+        s._source = copy.copy(self._source) \
+            if self._source is not None else None
         s._highlight = self._highlight.copy()
         s._highlight_opts = self._highlight_opts.copy()
         s._suggest = self._suggest.copy()
@@ -333,17 +422,13 @@ class Search(Request):
         aggs = d.pop('aggs', d.pop('aggregations', {}))
         if aggs:
             self.aggs._params = {
-                'aggs': dict(
-                    (name, A(value)) for (name, value) in iteritems(aggs))
+                'aggs': {
+                    name: A(value) for (name, value) in iteritems(aggs)}
             }
         if 'sort' in d:
             self._sort = d.pop('sort')
         if '_source' in d:
             self._source = d.pop('_source')
-        if 'fields' in d:
-            self._fields = d.pop('fields')
-        if 'partial_fields' in d:
-            self._partial_fields = d.pop('partial_fields')
         if 'highlight' in d:
             high = d.pop('highlight').copy()
             self._highlight = high.pop('fields')
@@ -356,7 +441,7 @@ class Search(Request):
                     s.setdefault('text', text)
         if 'script_fields' in d:
             self._script_fields = d.pop('script_fields')
-        self._extra = d
+        self._extra.update(d)
         return self
 
     def script_fields(self, **kwargs):
@@ -371,8 +456,10 @@ class Search(Request):
             s = s.script_fields(times_two="doc['field'].value * 2")
             s = s.script_fields(
                 times_three={
-                    'script': "doc['field'].value * n",
-                    'params': {'n': 3}
+                    'script': {
+                        'inline': "doc['field'].value * params.n",
+                        'params': {'n': 3}
+                    }
                 }
             )
 
@@ -384,15 +471,15 @@ class Search(Request):
         s._script_fields.update(kwargs)
         return s
 
-    def source(self, **kwargs):
+    def source(self, fields=None, **kwargs):
         """
         Selectively control how the _source field is returned.
 
-        :arg source: wildcard string, array of wildcards, or dictionary of includes and excludes
+        :arg fields: wildcard string, array of wildcards, or dictionary of includes and excludes
 
-        If ``source`` is None, the entire document will be returned for
-        each hit.  If source is a dictionary with keys of 'include' and/or
-        'exclude' the fields will be either included or excluded appropriately.
+        If ``fields`` is None, the entire document will be returned for
+        each hit.  If fields is a dictionary with keys of 'includes' and/or
+        'excludes' the fields will be either included or excluded appropriately.
 
         Calling this multiple times with the same named parameter will override the
         previous values with the new ones.
@@ -400,15 +487,22 @@ class Search(Request):
         Example::
 
             s = Search()
-            s = s.source(include=['obj1.*'], exclude=["*.description"])
+            s = s.source(includes=['obj1.*'], excludes=["*.description"])
 
             s = Search()
-            s = s.source(include=['obj1.*']).source(exclude=["*.description"])
+            s = s.source(includes=['obj1.*']).source(excludes=["*.description"])
 
         """
         s = self._clone()
 
-        if s._source is None:
+        if fields and kwargs:
+            raise ValueError("You cannot specify fields and kwargs at the same time.")
+
+        if fields is not None:
+            s._source = fields
+            return s
+
+        if kwargs and not isinstance(s._source, dict):
             s._source = {}
 
         for key, value in kwargs.items():
@@ -420,43 +514,6 @@ class Search(Request):
             else:
                 s._source[key] = value
 
-        return s
-
-    def fields(self, fields=None):
-        """
-        Selectively load specific stored fields for each document.
-
-        :arg fields: list of fields to return for each document
-
-        If ``fields`` is None, the entire document will be returned for
-        each hit.  If fields is the empty list, no fields will be
-        returned for each hit, just the metadata.
-        """
-        s = self._clone()
-        s._fields = fields
-        return s
-
-    def partial_fields(self, **partial):
-        """
-        Control which part of the fields to extract from the `_source` document
-
-        :kwargs partial: dict specifying which fields to extract from the source
-
-        An example usage would be:
-
-            s = Search().partial_fields(authors_data={
-                    'include': ['authors.*'],
-                    'exclude': ['authors.name']
-                })
-
-        which will include all fields from the `authors` nested property except for
-        each authors `name`
-
-        If ``partial`` is not provided, the whole `_source` will be fetched. Calling this multiple
-        times will override the previous values with the new ones.
-        """
-        s = self._clone()
-        s._partial_fields = partial
         return s
 
     def sort(self, *keys):
@@ -486,6 +543,8 @@ class Search(Request):
         s._sort = []
         for k in keys:
             if isinstance(k, string_types) and k.startswith('-'):
+                if k[1:] == '_score':
+                    raise IllegalOperation('Sorting by `-_score` is not allowed.')
                 k = {k[1:]: {"order": "desc"}}
             s._sort.append(k)
         return s
@@ -505,7 +564,7 @@ class Search(Request):
     def highlight(self, *fields, **kwargs):
         """
         Request highlighting of some fields. All keyword arguments passed in will be
-        used as parameters. Example::
+        used as parameters for all the fields in the ``fields`` parameter. Example::
 
             Search().highlight('title', 'body', fragment_size=50)
 
@@ -515,6 +574,21 @@ class Search(Request):
                 "highlight": {
                     "fields": {
                         "body": {"fragment_size": 50},
+                        "title": {"fragment_size": 50}
+                    }
+                }
+            }
+
+        If you want to have different options for different fields you can call ``highlight`` twice::
+
+            Search().highlight('title', fragment_size=50).highlight('body', fragment_size=100)
+
+        which will produce::
+
+            {
+                "highlight": {
+                    "fields": {
+                        "body": {"fragment_size": 100},
                         "title": {"fragment_size": 50}
                     }
                 }
@@ -548,18 +622,21 @@ class Search(Request):
         Serialize the search into the dictionary that will be sent over as the
         request's body.
 
-        :arg count: a flag to specify we are interested in a body for count -
+        :arg count: a flag to specify if we are interested in a body for count -
             no aggregations, no pagination bounds etc.
 
         All additional keyword arguments will be included into the dictionary.
         """
-        d = {"query": self.query.to_dict()}
+        d = {}
 
-        if self.post_filter:
-            d['post_filter'] = self.post_filter.to_dict()
+        if self.query:
+            d["query"] = self.query.to_dict()
 
         # count request doesn't care for sorting and other things
         if not count:
+            if self.post_filter:
+                d['post_filter'] = self.post_filter.to_dict()
+
             if self.aggs.aggs:
                 d.update(self.aggs.to_dict())
 
@@ -568,14 +645,8 @@ class Search(Request):
 
             d.update(self._extra)
 
-            if self._source:
+            if self._source not in (None, {}):
                 d['_source'] = self._source
-
-            if self._fields is not None:
-                d['fields'] = self._fields
-
-            if self._partial_fields:
-                d['partial_fields'] = self._partial_fields
 
             if self._highlight:
                 d['highlight'] = {'fields': self._highlight}
@@ -595,16 +666,15 @@ class Search(Request):
         Return the number of hits matching the query and filters. Note that
         only the actual number is returned.
         """
-        if hasattr(self, '_response'):
-            return self._response.hits.total
+        if hasattr(self, '_response') and self._response.hits.total.relation == 'eq':
+            return self._response.hits.total.value
 
-        es = connections.get_connection(self._using)
+        es = get_connection(self._using)
 
         d = self.to_dict(count=True)
         # TODO: failed shards detection
         return es.count(
             index=self._index,
-            doc_type=self._doc_type,
             body=d,
             **self._params
         )['count']
@@ -614,35 +684,21 @@ class Search(Request):
         Execute the search and return an instance of ``Response`` wrapping all
         the data.
 
-        :arg response_class: optional subclass of ``Response`` to use instead.
+        :arg ignore_cache: if set to ``True``, consecutive calls will hit
+            ES, while cached result will be ignored. Defaults to `False`
         """
         if ignore_cache or not hasattr(self, '_response'):
-            es = connections.get_connection(self._using)
+            es = get_connection(self._using)
 
             self._response = self._response_class(
+                self,
                 es.search(
                     index=self._index,
-                    doc_type=self._doc_type,
                     body=self.to_dict(),
                     **self._params
-                ),
-                callbacks=self._doc_type_map
+                )
             )
         return self._response
-
-    def execute_suggest(self):
-        """
-        Execute just the suggesters. Ignores all parts of the request that are
-        not relevant, including ``query`` and ``doc_type``.
-        """
-        es = connections.get_connection(self._using)
-        return SuggestResponse(
-            es.suggest(
-                index=self._index,
-                body=self._suggest,
-                **self._params
-            )
-        )
 
     def scan(self):
         """
@@ -654,19 +710,37 @@ class Search(Request):
         https://elasticsearch-py.readthedocs.io/en/master/helpers.html#elasticsearch.helpers.scan
 
         """
-        es = connections.get_connection(self._using)
+        es = get_connection(self._using)
 
         for hit in scan(
                 es,
                 query=self.to_dict(),
                 index=self._index,
-                doc_type=self._doc_type,
                 **self._params
-            ):
-            yield self._doc_type_map.get(hit['_type'], Result)(hit)
+        ):
+            yield self._get_result(hit)
+
+    def delete(self):
+        """
+        delete() executes the query by delegating to delete_by_query()
+        """
+
+        es = get_connection(self._using)
+
+        return AttrDict(
+            es.delete_by_query(
+                index=self._index,
+                body=self.to_dict(),
+                **self._params
+            )
+        )
 
 
 class MultiSearch(Request):
+    """
+    Combine multiple :class:`~elasticsearch_dsl.Search` objects into a single
+    request.
+    """
     def __init__(self, **kwargs):
         super(MultiSearch, self).__init__(**kwargs)
         self._searches = []
@@ -683,6 +757,13 @@ class MultiSearch(Request):
         return ms
 
     def add(self, search):
+        """
+        Adds a new :class:`~elasticsearch_dsl.Search` object to the request::
+
+            ms = MultiSearch(index='my-index')
+            ms = ms.add(Search(doc_type=Category).filter('term', category='python'))
+            ms = ms.add(Search(doc_type=Blog))
+        """
         ms = self._clone()
         ms._searches.append(search)
         return ms
@@ -693,8 +774,6 @@ class MultiSearch(Request):
             meta = {}
             if s._index:
                 meta['index'] = s._index
-            if s._doc_type:
-                meta['type'] = s._doc_type
             meta.update(s._params)
 
             out.append(meta)
@@ -703,12 +782,14 @@ class MultiSearch(Request):
         return out
 
     def execute(self, ignore_cache=False, raise_on_error=True):
+        """
+        Execute the multi search request and return a list of search results.
+        """
         if ignore_cache or not hasattr(self, '_response'):
-            es = connections.get_connection(self._using)
+            es = get_connection(self._using)
 
             responses = es.msearch(
                 index=self._index,
-                doc_type=self._doc_type,
                 body=self.to_dict(),
                 **self._params
             )
@@ -720,8 +801,7 @@ class MultiSearch(Request):
                         raise TransportError('N/A', r['error']['type'], r['error'])
                     r = None
                 else:
-                    r = Response(r, callbacks=s._doc_type_map)
-                    r.search = s
+                    r = Response(s, r)
                 out.append(r)
 
             self._response = out
