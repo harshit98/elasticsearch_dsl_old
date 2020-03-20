@@ -1,2 +1,2 @@
-# elasticsearch_v2_manager
-Elasticsearch 2.4 Query Manager.
+# ElasticSearch Version Manager
+Elasticsearch Version Manager manages two versions simultaneously without giving raise to any conflict.
