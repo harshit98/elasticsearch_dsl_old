@@ -6,10 +6,6 @@ VERSION = (2, 2, 0)
 __version__ = VERSION
 __versionstr__ = '.'.join(map(str, VERSION))
 
-f = open(join(dirname(__file__), 'README'))
-long_description = f.read().strip()
-f.close()
-
 install_requires = [
     'six',
     'python-dateutil',
@@ -32,7 +28,6 @@ setup(
     description = "Python client for Elasticsearch",
     license="Apache License, Version 2.0",
     url = "https://github.com/elasticsearch/elasticsearch-dsl-py",
-    long_description = long_description,
     version = __versionstr__,
     author = "Honza Král",
     author_email = "honza.kral@gmail.com",
