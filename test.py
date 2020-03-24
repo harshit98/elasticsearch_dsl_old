@@ -1,2 +1,2 @@
-from elasticsearch_dsl_old import VERSION
+from elasticsearch_dsl_v2 import VERSION
 print(VERSION)
